@@ -1,20 +1,21 @@
-
 import os
 import re
 import json
 import sqlite3
-from contextlib import asynccontextmanager
+import threading
 
 import httpx
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 
-# Set these two environment variables in Render using your own
-# signed URLs from the assignment.
-RATES_URL = os.getenv("RATES_URL", "")
-EXPORT_URL = os.getenv("EXPORT_URL", "")
+# --------------------------------------------------
+# 1. CONFIGURATION
+# --------------------------------------------------
+
+RATES_URL = os.environ.get("RATES_URL", "").strip()
+EXPORT_URL = os.environ.get("EXPORT_URL", "").strip()
 
 HEADERS = {
     "User-Agent": (
@@ -24,7 +25,120 @@ HEADERS = {
     )
 }
 
-DB = sqlite3.connect(":memory:", check_same_thread=False)
+
+# --------------------------------------------------
+# 2. DATABASE
+# --------------------------------------------------
+
+db_conn = sqlite3.connect(
+    ":memory:",
+    check_same_thread=False
+)
+
+db_lock = threading.Lock()
+
+
+def init_database():
+    """Download, process, and load the order data."""
+
+    if not RATES_URL or not EXPORT_URL:
+        raise RuntimeError(
+            "Set RATES_URL and EXPORT_URL in Render Environment Variables."
+        )
+
+    with httpx.Client(timeout=60.0, follow_redirects=True) as client:
+
+        print("Fetching currency rates from /rates...")
+
+        resp_rates = client.get(RATES_URL, headers=HEADERS)
+        resp_rates.raise_for_status()
+
+        usd_rates = resp_rates.json()["usd_per_unit"]
+        print("Currency Rates:", usd_rates)
+
+        print("Fetching raw order ledger from /export...")
+
+        resp_export = client.get(EXPORT_URL, headers=HEADERS)
+        resp_export.raise_for_status()
+
+        raw_lines = resp_export.text.strip().splitlines()
+
+        rows = [
+            json.loads(line)
+            for line in raw_lines
+            if line.strip()
+        ]
+
+        print(f"Total raw records downloaded: {len(rows)}")
+
+    if not rows:
+        raise RuntimeError("The export endpoint returned no order records.")
+
+    df = pd.DataFrame(rows)
+
+    # Parse timestamps into timezone-aware UTC.
+    df["created_at_utc"] = pd.to_datetime(
+        df["created_at"],
+        format="ISO8601",
+        utc=True
+    )
+
+    df["updated_at_utc"] = pd.to_datetime(
+        df["updated_at"],
+        format="ISO8601",
+        utc=True
+    )
+
+    # Keep the most recently updated record for each order ID.
+    df = (
+        df.sort_values("updated_at_utc", kind="mergesort")
+        .drop_duplicates(subset=["id"], keep="last")
+        .copy()
+    )
+
+    print(f"Total verified active orders: {len(df)}")
+
+    # Convert business dates to Asia/Kolkata.
+    ist_created = df["created_at_utc"].dt.tz_convert("Asia/Kolkata")
+
+    df["created_date"] = ist_created.dt.strftime("%Y-%m-%d")
+    df["created_month"] = ist_created.dt.strftime("%Y-%m")
+    df["created_year"] = ist_created.dt.year
+
+    # Standardize transaction amounts into USD.
+    df["rate_to_usd"] = df["currency"].map(usd_rates)
+
+    if df["rate_to_usd"].isna().any():
+        unknown = df.loc[
+            df["rate_to_usd"].isna(), "currency"
+        ].unique().tolist()
+
+        raise ValueError(f"Missing USD conversion rates for: {unknown}")
+
+    df["amount_usd"] = (
+        pd.to_numeric(df["amount"], errors="raise")
+        * df["rate_to_usd"]
+    )
+
+    # Remove intermediate timestamp columns before loading into SQLite.
+    df_sql = df.drop(
+        columns=["created_at_utc", "updated_at_utc"]
+    )
+
+    with db_lock:
+        df_sql.to_sql(
+            "orders",
+            db_conn,
+            index=False,
+            if_exists="replace"
+        )
+
+    print("In-memory SQLite database ready.")
+
+
+# --------------------------------------------------
+# 3. QUESTION PARSING CONFIGURATION
+# --------------------------------------------------
 
 MONTH_MAP = {
     "january": "01",
@@ -52,344 +166,190 @@ PRODUCTS = [
     "Grinder",
 ]
 
-REGIONS = ["North", "South", "East", "West", "Central"]
+REGIONS = [
+    "North",
+    "South",
+    "East",
+    "West",
+    "Central",
+]
 
 
-def init_database():
-    """Fetch the assignment's rates and ledger, then prepare SQLite."""
-
-    if not RATES_URL or not EXPORT_URL:
-        raise RuntimeError(
-            "Set your own RATES_URL and EXPORT_URL in Render "
-            "environment variables."
-        )
-
-    with httpx.Client(timeout=60.0, follow_redirects=True) as client:
-        print("Fetching currency rates...")
-
-        rates_response = client.get(RATES_URL, headers=HEADERS)
-        rates_response.raise_for_status()
-
-        rates_payload = rates_response.json()
-        usd_rates = rates_payload["usd_per_unit"]
-
-        print("Loaded currency rates:", usd_rates)
-
-        print("Fetching order ledger...")
-
-        export_response = client.get(EXPORT_URL, headers=HEADERS)
-        export_response.raise_for_status()
-
-        rows = [
-            json.loads(line)
-            for line in export_response.text.splitlines()
-            if line.strip()
-        ]
-
-    if not rows:
-        raise RuntimeError("The order ledger export returned no records.")
-
-    df = pd.DataFrame(rows)
-
-    required_columns = {
-        "id",
-        "customer",
-        "region",
-        "product",
-        "qty",
-        "amount",
-        "currency",
-        "status",
-        "created_at",
-        "updated_at",
-    }
-
-    missing = required_columns - set(df.columns)
-    if missing:
-        raise RuntimeError(
-            f"Ledger is missing required columns: {sorted(missing)}"
-        )
-
-    # Parse all timestamps consistently as UTC.
-    df["created_at_utc"] = pd.to_datetime(
-        df["created_at"], utc=True, errors="coerce"
-    )
-    df["updated_at_utc"] = pd.to_datetime(
-        df["updated_at"], utc=True, errors="coerce"
-    )
-
-    df = df.dropna(
-        subset=["id", "created_at_utc", "updated_at_utc"]
-    ).copy()
-
-    # Keep the latest version of each order.
-    df = (
-        df.sort_values("updated_at_utc", kind="mergesort")
-        .drop_duplicates(subset=["id"], keep="last")
-        .copy()
-    )
-
-    # Business dates use Asia/Kolkata.
-    local_created = df["created_at_utc"].dt.tz_convert("Asia/Kolkata")
-
-    df["created_date"] = local_created.dt.strftime("%Y-%m-%d")
-    df["created_month"] = local_created.dt.strftime("%Y-%m")
-    df["created_year"] = local_created.dt.year
-
-    # Normalize text fields and numeric fields.
-    for column in ["customer", "region", "product", "status", "currency"]:
-        df[column] = df[column].astype("string").str.strip()
-
-    df["region"] = df["region"].str.title()
-    df["product"] = df["product"].str.title()
-    df["status"] = df["status"].str.lower()
-    df["currency"] = df["currency"].str.upper()
-
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
-    df["qty"] = pd.to_numeric(df["qty"], errors="coerce")
-
-    # Use the assignment's live rates, not approximate hardcoded rates.
-    df["rate_to_usd"] = df["currency"].map(usd_rates)
-
-    if df["rate_to_usd"].isna().any():
-        missing_currencies = sorted(
-            df.loc[df["rate_to_usd"].isna(), "currency"]
-            .dropna()
-            .unique()
-            .tolist()
-        )
-        raise RuntimeError(
-            f"No USD conversion rate for currencies: {missing_currencies}"
-        )
-
-    df["amount_usd"] = df["amount"] * df["rate_to_usd"]
-
-    df = df.drop(
-        columns=["created_at_utc", "updated_at_utc"],
-        errors="ignore",
-    )
-
-    df.to_sql("orders", DB, index=False, if_exists="replace")
-
-    DB.execute(
-        "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)"
-    )
-    DB.execute(
-        "CREATE INDEX IF NOT EXISTS idx_orders_region ON orders(region)"
-    )
-    DB.execute(
-        "CREATE INDEX IF NOT EXISTS idx_orders_product ON orders(product)"
-    )
-    DB.execute(
-        "CREATE INDEX IF NOT EXISTS idx_orders_month ON orders(created_month)"
-    )
-    DB.commit()
-
-    print(f"Raw records downloaded: {len(rows)}")
-    print(f"Unique orders loaded: {len(df)}")
-    print("SQLite database ready.")
-
+# --------------------------------------------------
+# 4. CONVERT QUESTIONS INTO SQL
+# --------------------------------------------------
 
 def parse_question_to_sql(question: str):
-    """Translate supported business questions into parameterized SQL."""
-
-    q = question.lower().strip()
+    q_low = question.lower()
     conditions = []
-    params = []
 
-    # Status: questions without another status default to paid orders.
-    if re.search(r"\brefund(?:ed|s)?\b", q):
-        conditions.append("LOWER(status) = ?")
-        params.append("refunded")
-    elif re.search(r"\b(void|voided|cancel|cancelled|canceled)\b", q):
-        conditions.append("LOWER(status) IN (?, ?)")
-        params.extend(["void", "cancelled"])
+    # Status classification.
+    if re.search(r"\brefund(ed|s)?\b", q_low):
+        conditions.append("status = 'refunded'")
+
+    elif re.search(r"\b(void|voided|cancel|cancelled)\b", q_low):
+        conditions.append("status = 'void'")
+
     else:
-        conditions.append("LOWER(status) = ?")
-        params.append("paid")
+        conditions.append("status = 'paid'")
 
-    # Region.
-    for region in REGIONS:
-        if re.search(rf"\b{region.lower()}\b", q):
-            conditions.append("LOWER(region) = ?")
-            params.append(region.lower())
+    # Region filter.
+    for reg in REGIONS:
+        if re.search(rf"\b{reg.lower()}\b", q_low):
+            conditions.append(f"region = '{reg}'")
             break
 
-    # Product.
-    for product in PRODUCTS:
-        pattern = rf"\b{re.escape(product.lower())}s?\b"
-        if re.search(pattern, q):
-            conditions.append("LOWER(product) = ?")
-            params.append(product.lower())
+    # Product filter.
+    for prod in PRODUCTS:
+        if re.search(rf"\b{re.escape(prod.lower())}s?\b", q_low):
+            conditions.append(f"product = '{prod}'")
             break
 
-    # Customer ID, e.g. C1020.
-    customer_match = re.search(r"\b(c\d{4})\b", q, re.IGNORECASE)
-    if customer_match:
-        conditions.append("UPPER(customer) = ?")
-        params.append(customer_match.group(1).upper())
+    # Customer ID filter, for example C1234.
+    cust_match = re.search(r"\b(c\d{4})\b", q_low)
 
-    # Month and year. Only filter by year when the question specifies one.
-    year_match = re.search(r"\b(20\d{2})\b", q)
-    year = int(year_match.group(1)) if year_match else None
+    if cust_match:
+        conditions.append(
+            f"customer = '{cust_match.group(1).upper()}'"
+        )
 
-    month_number = None
-    for month_name, number in MONTH_MAP.items():
-        if re.search(rf"\b{month_name}\b", q):
-            month_number = number
+    # Date, month, and year filters.
+    year_match = re.search(r"\b(202\d)\b", q_low)
+
+    year_str = year_match.group(1) if year_match else "2026"
+
+    month_num = None
+
+    for m_name, m_val in MONTH_MAP.items():
+        if re.search(rf"\b{m_name}\b", q_low):
+            month_num = m_val
             break
 
-    if month_number and year:
-        conditions.append("created_month = ?")
-        params.append(f"{year}-{month_number}")
-    elif month_number:
-        conditions.append("SUBSTR(created_month, 6, 2) = ?")
-        params.append(month_number)
-    elif year:
-        conditions.append("created_year = ?")
-        params.append(year)
+    if month_num:
+        conditions.append(
+            f"created_month = '{year_str}-{month_num}'"
+        )
 
-    where_clause = " AND ".join(conditions) if conditions else "1=1"
+    elif year_match and "month" not in q_low:
+        conditions.append(f"created_year = {year_str}")
 
-    # Intent detection: specific metrics must come before total revenue.
-    asks_distinct_customers = any(
-        phrase in q
-        for phrase in [
-            "distinct customer",
-            "unique customer",
-            "different customer",
-            "how many customers",
-            "how many customer",
-        ]
+    where_clause = (
+        " AND ".join(conditions)
+        if conditions
+        else "1=1"
     )
 
-    if asks_distinct_customers:
+    # Top-selling product.
+    if any(p in q_low for p in [
+        "which product",
+        "what product",
+        "top-selling product",
+        "best-selling product",
+        "product earned the most",
+    ]):
+        order_metric = (
+            "SUM(qty)"
+            if any(w in q_low for w in ["qty", "quantity", "units"])
+            else "SUM(amount_usd)"
+        )
+
+        sql = (
+            f"SELECT product FROM orders WHERE {where_clause} "
+            f"GROUP BY product ORDER BY {order_metric} DESC LIMIT 1"
+        )
+
+        return sql, "string"
+
+    # Top customer.
+    if any(p in q_low for p in [
+        "which customer",
+        "what customer",
+        "top customer",
+        "customer spent the most",
+    ]):
+        sql = (
+            f"SELECT customer FROM orders WHERE {where_clause} "
+            "GROUP BY customer "
+            "ORDER BY SUM(amount_usd) DESC LIMIT 1"
+        )
+
+        return sql, "string"
+
+    # Top region.
+    if any(p in q_low for p in [
+        "which region",
+        "what region",
+        "top region",
+        "region earned the most",
+    ]):
+        sql = (
+            f"SELECT region FROM orders WHERE {where_clause} "
+            "GROUP BY region "
+            "ORDER BY SUM(amount_usd) DESC LIMIT 1"
+        )
+
+        return sql, "string"
+
+    # Count distinct customers.
+    if any(p in q_low for p in [
+        "distinct customer",
+        "different customer",
+        "unique customer",
+        "how many customer",
+    ]):
         sql = (
             "SELECT COUNT(DISTINCT customer) "
             f"FROM orders WHERE {where_clause}"
         )
-        return sql, params, "int"
 
-    asks_count = (
-        any(
-            phrase in q
-            for phrase in [
-                "how many",
-                "count the",
-                "count of",
-                "number of",
-                "count ",
-            ]
+        return sql, "int"
+
+    # Average order amount in USD.
+    if "average" in q_low:
+        sql = (
+            "SELECT ROUND(COALESCE(AVG(amount_usd), 0), 2) "
+            f"FROM orders WHERE {where_clause}"
         )
-        or q.startswith("count")
+
+        return sql, "money"
+
+    # Count orders.
+    if any(p in q_low for p in [
+        "how many orders",
+        "count the",
+        "number of orders",
+        "how many refunded",
+    ]):
+        sql = f"SELECT COUNT(*) FROM orders WHERE {where_clause}"
+        return sql, "int"
+
+    # Total quantity.
+    if any(p in q_low for p in [
+        "how many units",
+        "total quantity",
+        "total units",
+    ]):
+        sql = (
+            "SELECT COALESCE(SUM(qty), 0) "
+            f"FROM orders WHERE {where_clause}"
+        )
+
+        return sql, "int"
+
+    # Default: total revenue, earnings, or sales in USD.
+    sql = (
+        "SELECT ROUND(COALESCE(SUM(amount_usd), 0), 2) "
+        f"FROM orders WHERE {where_clause}"
     )
 
-    if asks_count and any(word in q for word in ["order", "refund", "void"]):
-        sql = f"SELECT COUNT(*) FROM orders WHERE {where_clause}"
-        return sql, params, "int"
-
-    if any(
-        phrase in q
-        for phrase in ["how many units", "total quantity", "total units"]
-    ):
-        sql = f"""
-            SELECT COALESCE(SUM(qty), 0)
-            FROM orders
-            WHERE {where_clause}
-        """
-        return sql, params, "int"
-
-    if any(
-        phrase in q
-        for phrase in [
-            "which product",
-            "what product",
-            "top-selling product",
-            "best-selling product",
-            "product earned the most",
-        ]
-    ):
-        metric = (
-            "SUM(qty)"
-            if any(word in q for word in ["quantity", "units", "qty"])
-            else "SUM(amount_usd)"
-        )
-        sql = f"""
-            SELECT product
-            FROM orders
-            WHERE {where_clause}
-            GROUP BY product
-            ORDER BY {metric} DESC, product ASC
-            LIMIT 1
-        """
-        return sql, params, "string"
-
-    if any(
-        phrase in q
-        for phrase in [
-            "which customer",
-            "what customer",
-            "top customer",
-            "customer spent the most",
-        ]
-    ):
-        sql = f"""
-            SELECT customer
-            FROM orders
-            WHERE {where_clause}
-            GROUP BY customer
-            ORDER BY SUM(amount_usd) DESC, customer ASC
-            LIMIT 1
-        """
-        return sql, params, "string"
-
-    if any(
-        phrase in q
-        for phrase in [
-            "which region",
-            "what region",
-            "top region",
-            "region earned the most",
-        ]
-    ):
-        sql = f"""
-            SELECT region
-            FROM orders
-            WHERE {where_clause}
-            GROUP BY region
-            ORDER BY SUM(amount_usd) DESC, region ASC
-            LIMIT 1
-        """
-        return sql, params, "string"
-
-    if "average" in q or "on average" in q:
-        sql = f"""
-            SELECT ROUND(COALESCE(AVG(amount_usd), 0), 2)
-            FROM orders
-            WHERE {where_clause}
-        """
-        return sql, params, "number"
-
-    # Default: total revenue / sales / order value.
-    sql = f"""
-        SELECT ROUND(COALESCE(SUM(amount_usd), 0), 2)
-        FROM orders
-        WHERE {where_clause}
-    """
-    return sql, params, "number"
+    return sql, "money"
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    init_database()
-    yield
-    DB.close()
+# --------------------------------------------------
+# 5. FASTAPI APPLICATION
+# --------------------------------------------------
 
-
-app = FastAPI(
-    title="Acme Appliances Order Ledger Agent",
-    lifespan=lifespan,
-)
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
@@ -399,47 +359,68 @@ app.add_middleware(
 )
 
 
-@app.get("/")
-async def health():
-    return {"status": "ok", "service": "Acme Appliances Order Ledger Agent"}
+@app.on_event("startup")
+def startup_event():
+    init_database()
 
+
+# --------------------------------------------------
+# 6. EXAM ENDPOINT
+# --------------------------------------------------
 
 @app.post("/")
 async def answer_question(request: Request):
     try:
         body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
 
-    question = body.get("question", "")
-    if not isinstance(question, str) or not question.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Please provide a non-empty question.",
-        )
+        if not isinstance(body, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="Request body must be a JSON object."
+            )
 
-    sql, params, answer_type = parse_question_to_sql(question)
+        question = body.get("question", "")
 
-    try:
-        cursor = DB.execute(sql, params)
-        row = cursor.fetchone()
-        value = row[0] if row and row[0] is not None else 0
+        if not isinstance(question, str) or not question.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="A non-empty question is required."
+            )
 
-        if answer_type == "int":
-            answer = int(value)
-        elif answer_type == "string":
-            answer = str(value)
+        print(f"[INCOMING QUESTION] {question}")
+
+        sql_query, ans_type = parse_question_to_sql(question)
+
+        print(f"[SQL EXECUTED] {sql_query}")
+
+        with db_lock:
+            cursor = db_conn.cursor()
+            cursor.execute(sql_query)
+            row = cursor.fetchone()
+            cursor.close()
+
+        val = row[0] if row and row[0] is not None else 0
+
+        if ans_type == "string":
+            result = str(val)
+
+        elif ans_type == "int":
+            result = int(val)
+
         else:
-            answer = round(float(value), 2)
+            result = round(float(val), 2)
 
-        print(f"Question: {question}")
-        print(f"Answer: {answer}")
+        print(f"[RESPONSE] {result}")
 
-        return {"answer": answer}
+        return {"answer": result}
 
-    except sqlite3.Error as exc:
-        print(f"SQL error: {exc}")
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        print(f"[ERROR] {exc}")
+
         raise HTTPException(
             status_code=500,
-            detail="Could not calculate the answer.",
+            detail="Unable to process the question."
         )
