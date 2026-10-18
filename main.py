@@ -1,3 +1,4 @@
+
 import json
 import re
 from datetime import datetime
@@ -52,71 +53,143 @@ def answer_question(question):
     q = question.lower()
     orders = ORDERS
 
-    # Identify an explicitly mentioned region.
+    # Filter by region.
     region = next(
-        (r for r in ["North", "South", "East", "West", "Central"]
-         if re.search(rf"\b{r.lower()}\b", q)),
+        (
+            r for r in ["North", "South", "East", "West", "Central"]
+            if re.search(rf"\b{r.lower()}\b", q)
+        ),
         None,
     )
+
     if region:
-        orders = [o for o in orders if o["region"].lower() == region.lower()]
+        orders = [
+            o for o in orders
+            if o["region"].lower() == region.lower()
+        ]
 
-    # Identify an explicitly mentioned product.
-    products = sorted({o["product"] for o in ORDERS}, key=len, reverse=True)
-    product = next((p for p in products if p.lower() in q), None)
+    # Filter by product.
+    products = sorted(
+        {o["product"] for o in ORDERS},
+        key=len,
+        reverse=True,
+    )
+
+    product = next(
+        (p for p in products if p.lower() in q),
+        None,
+    )
+
     if product:
-        orders = [o for o in orders if o["product"].lower() == product.lower()]
+        orders = [
+            o for o in orders
+            if o["product"].lower() == product.lower()
+        ]
 
-    # Identify an explicitly mentioned customer ID.
+    # Filter by customer ID.
     customer_match = re.search(r"\bc\d{4}\b", q, re.I)
+
     if customer_match:
         customer = customer_match.group().upper()
-        orders = [o for o in orders if o["customer"].upper() == customer]
+        orders = [
+            o for o in orders
+            if o["customer"].upper() == customer
+        ]
 
-    # Filter by month and year, when both are mentioned.
+    # Filter by month and year using the order placement date.
     month_names = {
-        "january": 1, "february": 2, "march": 3, "april": 4,
-        "may": 5, "june": 6, "july": 7, "august": 8,
-        "september": 9, "october": 10, "november": 11, "december": 12,
+        "january": 1,
+        "february": 2,
+        "march": 3,
+        "april": 4,
+        "may": 5,
+        "june": 6,
+        "july": 7,
+        "august": 8,
+        "september": 9,
+        "october": 10,
+        "november": 11,
+        "december": 12,
     }
+
     month = next(
-        (num for name, num in month_names.items()
-         if re.search(rf"\b{name}\b", q)),
+        (
+            num for name, num in month_names.items()
+            if re.search(rf"\b{name}\b", q)
+        ),
         None,
     )
+
     year_match = re.search(r"\b(20\d{2})\b", q)
     year = int(year_match.group(1)) if year_match else None
 
-    if month and year:
+    if month is not None and year is not None:
         orders = [
             o for o in orders
             if business_date(o["created_at"]).month == month
             and business_date(o["created_at"]).year == year
         ]
 
-    # Revenue only counts orders whose current status is paid.
+    # Count refunded orders after all requested filters.
+    if "refund" in q:
+        refunded = [
+            o for o in orders
+            if o["status"].lower() == "refunded"
+        ]
+
+        if any(
+            word in q
+            for word in ["count", "how many", "number of"]
+        ):
+            return str(len(refunded))
+
+        total = sum(amount_usd(o) for o in refunded)
+        return (
+            f"{len(refunded)} refunded orders; "
+            f"total value ${total:,.2f} USD"
+        )
+
+    # Revenue includes only currently paid orders.
     if any(word in q for word in ["revenue", "sales", "turnover"]):
-        paid = [o for o in orders if o["status"] == "paid"]
+        paid = [
+            o for o in orders
+            if o["status"].lower() == "paid"
+        ]
+
         total = sum(amount_usd(o) for o in paid)
         return f"${total:,.2f} USD"
 
-    if "refund" in q:
-        refunded = [o for o in orders if o["status"] == "refunded"]
-        total = sum(amount_usd(o) for o in refunded)
-        return f"{len(refunded)} refunded orders; total value ${total:,.2f} USD"
-
+    # Count void orders.
     if "void" in q:
-        voided = [o for o in orders if o["status"] == "void"]
-        return f"{len(voided)} void orders"
+        voided = [
+            o for o in orders
+            if o["status"].lower() == "void"
+        ]
 
-    if "how many" in q or "count" in q or "number of" in q:
+        return str(len(voided)) if "count" in q else (
+            f"{len(voided)} void orders"
+        )
+
+    # General order count.
+    if any(
+        phrase in q
+        for phrase in ["how many", "count", "number of"]
+    ):
         return str(len(orders))
 
-    if "top" in q or "most popular" in q or "best-selling" in q:
+    # Most popular or best-selling product among paid orders.
+    if any(
+        phrase in q
+        for phrase in ["top", "most popular", "best-selling"]
+    ):
         counts = {}
+
         for o in orders:
-            if o["status"] == "paid":
-                counts[o["product"]] = counts.get(o["product"], 0) + 1
+            if o["status"].lower() == "paid":
+                counts[o["product"]] = (
+                    counts.get(o["product"], 0) + 1
+                )
+
         if counts:
             name = max(counts, key=counts.get)
             return f"{name}: {counts[name]} paid orders"
@@ -134,7 +207,10 @@ class QuestionRequest(BaseModel):
 
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "Acme Appliances order ledger"}
+    return {
+        "status": "ok",
+        "service": "Acme Appliances order ledger",
+    }
 
 
 @app.post("/")
