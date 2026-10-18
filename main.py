@@ -1,4 +1,3 @@
-
 import json
 import re
 import requests
@@ -103,12 +102,16 @@ def answer_question(question):
     else:
         date_col = "business_created"
 
+    # ------------------------------------------------------------------
     # Status filters.
+    # ------------------------------------------------------------------
     if re.search(r"\b(refunded|refunds|refund)\b", q):
         df = df[df["status"].str.lower() == "refunded"]
-    elif re.search(r"\b(void|voided)\b", q):
+    elif re.search(r"\b(void|voided|cancel+ed?)\b", q):
         df = df[df["status"].str.lower() == "void"]
-    elif re.search(r"\bpaid\b", q):
+    elif re.search(
+        r"\b(paid|bought|buy|purchase[sd]?|sold)\b", q
+    ):
         df = df[df["status"].str.lower() == "paid"]
     elif re.search(
         r"\b(revenue|sales|turnover|earned|income)\b", q
@@ -116,32 +119,50 @@ def answer_question(question):
         # Ledger rule: revenue includes paid orders only.
         df = df[df["status"].str.lower() == "paid"]
 
+    # ------------------------------------------------------------------
     # Region filter.
+    # ------------------------------------------------------------------
     for region in orders_df["region"].dropna().unique():
-        if re.search(r"\b" + re.escape(str(region).lower()) + r"\b", q):
+        if re.search(
+            r"\b" + re.escape(str(region).lower()) + r"\b", q
+        ):
             df = df[df["region"].str.lower() == str(region).lower()]
             break
 
+    # ------------------------------------------------------------------
     # Product filter.
+    # ------------------------------------------------------------------
     for product in orders_df["product"].dropna().unique():
-        if re.search(r"\b" + re.escape(str(product).lower()) + r"\b", q):
+        if re.search(
+            r"\b" + re.escape(str(product).lower()) + r"s?\b", q
+        ):
             df = df[df["product"].str.lower() == str(product).lower()]
             break
 
+    # ------------------------------------------------------------------
     # Customer and order ID filters.
+    # ------------------------------------------------------------------
     customer_match = re.search(r"\bc\d+\b", q, re.I)
     if customer_match:
-        df = df[df["customer"].str.upper() == customer_match.group().upper()]
+        df = df[
+            df["customer"].str.upper() == customer_match.group().upper()
+        ]
 
     order_match = re.search(r"\bord-\d+\b", q, re.I)
     if order_match:
         df = df[df["id"].str.upper() == order_match.group().upper()]
 
+    # ------------------------------------------------------------------
     # Currency requested in the question.
+    # ------------------------------------------------------------------
     currency_match = re.search(r"\b(INR|USD|EUR)\b", question, re.I)
-    currency = currency_match.group(1).upper() if currency_match else "USD"
+    currency = (
+        currency_match.group(1).upper() if currency_match else "USD"
+    )
 
+    # ------------------------------------------------------------------
     # Year and month filters.
+    # ------------------------------------------------------------------
     year_match = re.search(r"\b(20\d{2})\b", q)
     month_number = None
 
@@ -156,7 +177,9 @@ def answer_question(question):
     if month_number is not None:
         df = df[df[date_col].dt.month == month_number]
 
+    # ------------------------------------------------------------------
     # Explicit date range, inclusive of the end date.
+    # ------------------------------------------------------------------
     date_range = re.search(
         r"from\s+(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})",
         q,
@@ -177,16 +200,22 @@ def answer_question(question):
     if df.empty:
         return {"answer": "0"}
 
-    # Rank questions must return the ranked entity, not a total.
+    # ------------------------------------------------------------------
+    # Intent flags.
+    # ------------------------------------------------------------------
     ranking = any(
         word in q for word in
-        ["most", "highest", "top", "largest", "greatest", "least", "lowest"]
+        ["most", "highest", "top", "largest", "greatest",
+         "least", "lowest"]
     )
     is_revenue_question = any(
         word in q for word in
         ["revenue", "sales", "earned", "income", "turnover"]
     )
 
+    # ------------------------------------------------------------------
+    # Rank questions must return the ranked entity, not a total.
+    # ------------------------------------------------------------------
     if ranking and "product" in q and is_revenue_question:
         paid = df[df["status"].str.lower() == "paid"]
         if paid.empty:
@@ -207,7 +236,23 @@ def answer_question(question):
         ) else totals.idxmax()
         return {"answer": str(region)}
 
+    if ranking and "customer" in q and is_revenue_question:
+        paid = df[df["status"].str.lower() == "paid"]
+        if paid.empty:
+            return {"answer": "0"}
+        totals = paid.groupby("customer")["usd_amount"].sum()
+        customer = totals.idxmin() if any(
+            word in q for word in ["least", "lowest"]
+        ) else totals.idxmax()
+        return {"answer": str(customer)}
+
+    # ------------------------------------------------------------------
     # Count questions.
+    # ------------------------------------------------------------------
+    is_unit_question = any(
+        x in q for x in ["unit", "quantity", "qty", "units sold"]
+    )
+
     asks_count = (
         any(x in q for x in [
             "how many", "number of", "count of", "count orders",
@@ -217,16 +262,26 @@ def answer_question(question):
         or re.search(r"\b(count|quantity of orders)\b", q)
     )
 
-    if asks_count:
-        if "customer" in q and "order" not in q:
+    if asks_count and not is_unit_question:
+        if re.search(r"\bcustomer", q):
             result = df["customer"].nunique()
-        elif "product" in q and "order" not in q:
+        elif re.search(r"\bproduct", q):
             result = df["product"].nunique()
+        elif re.search(r"\bregion", q):
+            result = df["region"].nunique()
         else:
             result = df["id"].nunique()
         return {"answer": str(int(result))}
 
+    # Explicit unit / quantity totals.
+    if is_unit_question and any(
+        x in q for x in ["total", "sum", "how many", "number of"]
+    ):
+        return {"answer": str(int(df["qty"].sum()))}
+
+    # ------------------------------------------------------------------
     # Average questions.
+    # ------------------------------------------------------------------
     if any(x in q for x in ["average", "mean"]):
         if "quantity" in q or "units" in q:
             result = df["qty"].mean()
@@ -238,7 +293,9 @@ def answer_question(question):
             result = money_values(df, currency).mean()
         return {"answer": f"{result:.2f}"}
 
+    # ------------------------------------------------------------------
     # Monetary calculations.
+    # ------------------------------------------------------------------
     if any(x in q for x in [
         "revenue", "sales", "turnover", "earned", "income",
         "total", "sum", "amount", "value", "how much", "refund",
@@ -249,11 +306,17 @@ def answer_question(question):
         result = money_values(df, currency).sum()
         return {"answer": f"{result:.2f}"}
 
+    # ------------------------------------------------------------------
     # A specific order query defaults to its amount.
+    # ------------------------------------------------------------------
     if order_match:
-        return {"answer": f"{money_values(df, currency).sum():.2f}"}
+        return {
+            "answer": f"{money_values(df, currency).sum():.2f}"
+        }
 
+    # ------------------------------------------------------------------
     # Otherwise return the number of matching unique orders.
+    # ------------------------------------------------------------------
     return {"answer": str(int(df["id"].nunique()))}
 
 
