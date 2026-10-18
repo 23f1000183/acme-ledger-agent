@@ -11,7 +11,12 @@ from pydantic import BaseModel
 BASE_DIR = Path(__file__).resolve().parent
 DATA_FILE = BASE_DIR / "export.json"
 
-RATES = {"USD": 1.0, "EUR": 1.05, "INR": 0.01214}
+RATES = {
+    "USD": 1.0,
+    "EUR": 1.05,
+    "INR": 0.01214,
+}
+
 TZ = ZoneInfo("Asia/Kolkata")
 
 app = FastAPI(title="Acme Appliances Order Ledger Agent")
@@ -26,12 +31,17 @@ def load_orders():
                 continue
 
             row = json.loads(line)
+
             updated = datetime.fromisoformat(
                 row["updated_at"].replace("Z", "+00:00")
             )
+
             order_id = row["id"]
 
-            if order_id not in latest or updated > latest[order_id][0]:
+            if (
+                order_id not in latest
+                or updated > latest[order_id][0]
+            ):
                 latest[order_id] = (updated, row)
 
     return [item[1] for item in latest.values()]
@@ -41,19 +51,26 @@ ORDERS = load_orders()
 
 
 def business_date(value):
-    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    dt = datetime.fromisoformat(
+        value.replace("Z", "+00:00")
+    )
     return dt.astimezone(TZ).date()
 
 
 def amount_usd(order):
-    return float(order["amount"]) * RATES[order["currency"]]
+    currency = order["currency"].upper()
+
+    if currency not in RATES:
+        raise ValueError(f"Unsupported currency: {currency}")
+
+    return float(order["amount"]) * RATES[currency]
 
 
 def answer_question(question):
     q = question.lower()
     orders = ORDERS
 
-    # Region filter.
+    # Region filter
     region = next(
         (
             r for r in ["North", "South", "East", "West", "Central"]
@@ -68,7 +85,7 @@ def answer_question(question):
             if o["region"].lower() == region.lower()
         ]
 
-    # Product filter.
+    # Product filter: match complete product names
     products = sorted(
         {o["product"] for o in ORDERS},
         key=len,
@@ -76,7 +93,13 @@ def answer_question(question):
     )
 
     product = next(
-        (p for p in products if re.search(rf"\b{re.escape(p.lower())}\b", q)),
+        (
+            p for p in products
+            if re.search(
+                rf"(?<!\w){re.escape(p.lower())}(?!\w)",
+                q,
+            )
+        ),
         None,
     )
 
@@ -86,26 +109,35 @@ def answer_question(question):
             if o["product"].lower() == product.lower()
         ]
 
-    # Customer ID filter.
+    # Customer ID filter
     customer_match = re.search(r"\bc\d{4}\b", q, re.I)
 
     if customer_match:
         customer = customer_match.group().upper()
         orders = [
             o for o in orders
-            if o["customer"].upper() == customer
+            if str(o["customer"]).upper() == customer
         ]
 
-    # Month and year filter, based on order placement date.
+    # Month and year filter
     month_names = {
-        "january": 1, "february": 2, "march": 3, "april": 4,
-        "may": 5, "june": 6, "july": 7, "august": 8,
-        "september": 9, "october": 10, "november": 11, "december": 12,
+        "january": 1,
+        "february": 2,
+        "march": 3,
+        "april": 4,
+        "may": 5,
+        "june": 6,
+        "july": 7,
+        "august": 8,
+        "september": 9,
+        "october": 10,
+        "november": 11,
+        "december": 12,
     }
 
     month = next(
         (
-            num for name, num in month_names.items()
+            number for name, number in month_names.items()
             if re.search(rf"\b{name}\b", q)
         ),
         None,
@@ -114,26 +146,29 @@ def answer_question(question):
     year_match = re.search(r"\b(20\d{2})\b", q)
     year = int(year_match.group(1)) if year_match else None
 
-    if month is not None and year is not None:
+    if month and year:
         orders = [
             o for o in orders
             if business_date(o["created_at"]).month == month
             and business_date(o["created_at"]).year == year
         ]
 
-    # IMPORTANT: Count distinct customers, not orders.
+    # Distinct customers among paid orders
     if (
         re.search(r"\b(distinct|unique)\s+customers?\b", q)
         or re.search(r"\bhow many different customers\b", q)
     ):
-        paid_orders = [
+        paid = [
             o for o in orders
             if o["status"].lower() == "paid"
         ]
-        customer_ids = {o["customer"] for o in paid_orders}
-        return str(len(customer_ids))
 
-    # Refund count or refund value.
+        return str(len({
+            str(o["customer"]).upper()
+            for o in paid
+        }))
+
+    # Refund counts
     if "refund" in q:
         refunded = [
             o for o in orders
@@ -149,44 +184,59 @@ def answer_question(question):
             f"total value ${total:,.2f} USD"
         )
 
-    # Void orders.
+    # Void counts
     if "void" in q:
         voided = [
             o for o in orders
             if o["status"].lower() == "void"
         ]
+        return str(len(voided))
 
-        if any(word in q for word in ["count", "how many", "number of"]):
-            return str(len(voided))
+    # Average/mean value per qualifying paid order.
+    # IMPORTANT: calculate this before the revenue branch.
+    if any(word in q for word in ["average", "avg", "mean"]):
+        paid = [
+            o for o in orders
+            if o["status"].lower() == "paid"
+        ]
 
-        return f"{len(voided)} void orders"
+        if not paid:
+            return "No matching paid orders"
 
-    # Revenue counts paid orders only.
+        total_usd = sum(amount_usd(o) for o in paid)
+        average_usd = total_usd / len(paid)
+
+        return f"${average_usd:.2f} USD"
+
+    # Revenue: current paid orders only
     if any(word in q for word in ["revenue", "sales", "turnover"]):
         paid = [
             o for o in orders
             if o["status"].lower() == "paid"
         ]
+
         total = sum(amount_usd(o) for o in paid)
         return f"${total:,.2f} USD"
 
-    # General order count.
-    if any(
-        phrase in q
-        for phrase in ["how many", "count", "number of"]
+    # Count orders
+    if (
+        "how many" in q
+        or "count" in q
+        or "number of" in q
     ):
         return str(len(orders))
 
-    # Top product by number of paid orders.
+    # Most popular product among paid orders
     if any(
         phrase in q
         for phrase in ["top", "most popular", "best-selling"]
     ):
         counts = {}
 
-        for o in orders:
-            if o["status"].lower() == "paid":
-                counts[o["product"]] = counts.get(o["product"], 0) + 1
+        for order in ORDERS:
+            if order["status"].lower() == "paid":
+                name = order["product"]
+                counts[name] = counts.get(name, 0) + 1
 
         if counts:
             name = max(counts, key=counts.get)
@@ -194,8 +244,8 @@ def answer_question(question):
 
     return (
         "I could not confidently interpret that question. "
-        "Try asking about revenue, order counts, refunds, a region, "
-        "a product, a customer ID, or a month and year."
+        "Try asking about average order value, revenue, order counts, "
+        "refunds, a region, a product, a customer ID, or a month and year."
     )
 
 
