@@ -23,7 +23,7 @@ MONTHS = {
     "october": 10, "november": 11, "december": 12,
 }
 
-# Any of these words means "revenue / money earned" -> paid orders only.
+# Any of these stems means "revenue / money earned" -> paid orders only.
 REVENUE_STEM = re.compile(
     r"\b(earn\w*|revenue\w*|sale\w*|turnover\w*|income\w*|"
     r"paid|bought|buy|purchas\w*|sold)\b",
@@ -203,6 +203,8 @@ def answer_question(question):
     # ------------------------------------------------------------------
     # Intent flags
     # ------------------------------------------------------------------
+    is_average = any(x in q for x in ["average", "mean"])
+
     ranking = any(
         word in q for word in
         ["most", "highest", "top", "largest", "greatest",
@@ -244,6 +246,21 @@ def answer_question(question):
         return {"answer": str(customer)}
 
     # ------------------------------------------------------------------
+    # Averages (MUST run before counts: "how many dollars on average"
+    # contains the phrase "how many")
+    # ------------------------------------------------------------------
+    if is_average:
+        if "quantity" in q or "units" in q:
+            result = df["qty"].mean()
+        elif "unit price" in q or "price per unit" in q:
+            result = (
+                df["unit_price"] * df["currency"].map(exchange_rates)
+            ).mean() / exchange_rates[currency]
+        else:
+            result = money_values(df, currency).mean()
+        return {"answer": f"{result:.2f}"}
+
+    # ------------------------------------------------------------------
     # Counts
     # ------------------------------------------------------------------
     is_unit_question = any(
@@ -257,7 +274,7 @@ def answer_question(question):
             "how many orders", "how many transactions",
         ])
         or re.search(r"\b(count|quantity of orders)\b", q)
-    )
+    ) and not is_average
 
     if asks_count and not is_unit_question:
         if re.search(r"\bcustomer", q):
@@ -274,20 +291,6 @@ def answer_question(question):
         x in q for x in ["total", "sum", "how many", "number of"]
     ):
         return {"answer": str(int(df["qty"].sum()))}
-
-    # ------------------------------------------------------------------
-    # Averages
-    # ------------------------------------------------------------------
-    if any(x in q for x in ["average", "mean"]):
-        if "quantity" in q or "units" in q:
-            result = df["qty"].mean()
-        elif "unit price" in q or "price per unit" in q:
-            result = (
-                df["unit_price"] * df["currency"].map(exchange_rates)
-            ).mean() / exchange_rates[currency]
-        else:
-            result = money_values(df, currency).mean()
-        return {"answer": f"{result:.2f}"}
 
     # ------------------------------------------------------------------
     # Monetary
@@ -328,8 +331,9 @@ def health():
 
 @app.post("/")
 def answer(request: QuestionRequest):
-    # This prints every question the grader sends and every answer
-    # you return. Look at Render -> Logs to see them.
+    # Every question the grader sends is printed here. Open
+    # Render -> your service -> Logs to see the [QUESTION] and
+    # [ANSWER] lines when the grader marks something wrong.
     print(f"[QUESTION] {request.question}", flush=True)
     try:
         result = answer_question(request.question)
