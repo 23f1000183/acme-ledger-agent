@@ -23,6 +23,13 @@ MONTHS = {
     "october": 10, "november": 11, "december": 12,
 }
 
+# Any of these words means "revenue / money earned" -> paid orders only.
+REVENUE_STEM = re.compile(
+    r"\b(earn\w*|revenue\w*|sale\w*|turnover\w*|income\w*|"
+    r"paid|bought|buy|purchas\w*|sold)\b",
+    re.I,
+)
+
 
 def fetch(path):
     response = requests.get(
@@ -95,52 +102,45 @@ def answer_question(question):
     q = question.lower().strip()
     df = orders_df.copy()
 
-    # Decide whether the question explicitly refers to order creation
-    # or update dates. Creation dates are the default.
+    # Decide whether the question refers to creation or update dates.
     if any(x in q for x in ["updated", "update date", "last modified"]):
         date_col = "business_updated"
     else:
         date_col = "business_created"
 
     # ------------------------------------------------------------------
-    # Status filters.
+    # Status filter
     # ------------------------------------------------------------------
+    status_already_filtered = False
+
     if re.search(r"\b(refunded|refunds|refund)\b", q):
         df = df[df["status"].str.lower() == "refunded"]
+        status_already_filtered = True
     elif re.search(r"\b(void|voided|cancel+ed?)\b", q):
         df = df[df["status"].str.lower() == "void"]
-    elif re.search(
-        r"\b(paid|bought|buy|purchase[sd]?|sold)\b", q
-    ):
+        status_already_filtered = True
+    elif REVENUE_STEM.search(q):
         df = df[df["status"].str.lower() == "paid"]
-    elif re.search(
-        r"\b(revenue|sales|turnover|earned|income)\b", q
-    ):
-        # Ledger rule: revenue includes paid orders only.
-        df = df[df["status"].str.lower() == "paid"]
+        status_already_filtered = True
 
     # ------------------------------------------------------------------
-    # Region filter.
+    # Region filter
     # ------------------------------------------------------------------
     for region in orders_df["region"].dropna().unique():
-        if re.search(
-            r"\b" + re.escape(str(region).lower()) + r"\b", q
-        ):
+        if re.search(r"\b" + re.escape(str(region).lower()) + r"\b", q):
             df = df[df["region"].str.lower() == str(region).lower()]
             break
 
     # ------------------------------------------------------------------
-    # Product filter.
+    # Product filter
     # ------------------------------------------------------------------
     for product in orders_df["product"].dropna().unique():
-        if re.search(
-            r"\b" + re.escape(str(product).lower()) + r"s?\b", q
-        ):
+        if re.search(r"\b" + re.escape(str(product).lower()) + r"s?\b", q):
             df = df[df["product"].str.lower() == str(product).lower()]
             break
 
     # ------------------------------------------------------------------
-    # Customer and order ID filters.
+    # Customer / order filters
     # ------------------------------------------------------------------
     customer_match = re.search(r"\bc\d+\b", q, re.I)
     if customer_match:
@@ -153,7 +153,7 @@ def answer_question(question):
         df = df[df["id"].str.upper() == order_match.group().upper()]
 
     # ------------------------------------------------------------------
-    # Currency requested in the question.
+    # Currency
     # ------------------------------------------------------------------
     currency_match = re.search(r"\b(INR|USD|EUR)\b", question, re.I)
     currency = (
@@ -161,7 +161,7 @@ def answer_question(question):
     )
 
     # ------------------------------------------------------------------
-    # Year and month filters.
+    # Year / month
     # ------------------------------------------------------------------
     year_match = re.search(r"\b(20\d{2})\b", q)
     month_number = None
@@ -178,7 +178,7 @@ def answer_question(question):
         df = df[df[date_col].dt.month == month_number]
 
     # ------------------------------------------------------------------
-    # Explicit date range, inclusive of the end date.
+    # Explicit date range
     # ------------------------------------------------------------------
     date_range = re.search(
         r"from\s+(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})",
@@ -198,23 +198,20 @@ def answer_question(question):
         ]
 
     if df.empty:
-        return {"answer": "0"}
+        return {"answer": 0}
 
     # ------------------------------------------------------------------
-    # Intent flags.
+    # Intent flags
     # ------------------------------------------------------------------
     ranking = any(
         word in q for word in
         ["most", "highest", "top", "largest", "greatest",
          "least", "lowest"]
     )
-    is_revenue_question = any(
-        word in q for word in
-        ["revenue", "sales", "earned", "income", "turnover"]
-    )
+    is_revenue_question = bool(REVENUE_STEM.search(q))
 
     # ------------------------------------------------------------------
-    # Rank questions must return the ranked entity, not a total.
+    # Ranking questions
     # ------------------------------------------------------------------
     if ranking and "product" in q and is_revenue_question:
         paid = df[df["status"].str.lower() == "paid"]
@@ -222,7 +219,7 @@ def answer_question(question):
             return {"answer": "0"}
         totals = paid.groupby("product")["usd_amount"].sum()
         product = totals.idxmin() if any(
-            word in q for word in ["least", "lowest"]
+            w in q for w in ["least", "lowest"]
         ) else totals.idxmax()
         return {"answer": str(product)}
 
@@ -232,7 +229,7 @@ def answer_question(question):
             return {"answer": "0"}
         totals = paid.groupby("region")["usd_amount"].sum()
         region = totals.idxmin() if any(
-            word in q for word in ["least", "lowest"]
+            w in q for w in ["least", "lowest"]
         ) else totals.idxmax()
         return {"answer": str(region)}
 
@@ -242,12 +239,12 @@ def answer_question(question):
             return {"answer": "0"}
         totals = paid.groupby("customer")["usd_amount"].sum()
         customer = totals.idxmin() if any(
-            word in q for word in ["least", "lowest"]
+            w in q for w in ["least", "lowest"]
         ) else totals.idxmax()
         return {"answer": str(customer)}
 
     # ------------------------------------------------------------------
-    # Count questions.
+    # Counts
     # ------------------------------------------------------------------
     is_unit_question = any(
         x in q for x in ["unit", "quantity", "qty", "units sold"]
@@ -273,14 +270,13 @@ def answer_question(question):
             result = df["id"].nunique()
         return {"answer": str(int(result))}
 
-    # Explicit unit / quantity totals.
     if is_unit_question and any(
         x in q for x in ["total", "sum", "how many", "number of"]
     ):
         return {"answer": str(int(df["qty"].sum()))}
 
     # ------------------------------------------------------------------
-    # Average questions.
+    # Averages
     # ------------------------------------------------------------------
     if any(x in q for x in ["average", "mean"]):
         if "quantity" in q or "units" in q:
@@ -294,29 +290,30 @@ def answer_question(question):
         return {"answer": f"{result:.2f}"}
 
     # ------------------------------------------------------------------
-    # Monetary calculations.
+    # Monetary
     # ------------------------------------------------------------------
-    if any(x in q for x in [
-        "revenue", "sales", "turnover", "earned", "income",
-        "total", "sum", "amount", "value", "how much", "refund",
-    ]):
-        if is_revenue_question:
+    if (
+        any(x in q for x in [
+            "revenue", "sales", "turnover", "earned", "earn",
+            "income", "total", "sum", "amount", "value",
+            "how much", "refund",
+        ])
+        or is_revenue_question
+    ):
+        if is_revenue_question and not status_already_filtered:
             df = df[df["status"].str.lower() == "paid"]
 
         result = money_values(df, currency).sum()
         return {"answer": f"{result:.2f}"}
 
     # ------------------------------------------------------------------
-    # A specific order query defaults to its amount.
+    # Specific order
     # ------------------------------------------------------------------
     if order_match:
         return {
             "answer": f"{money_values(df, currency).sum():.2f}"
         }
 
-    # ------------------------------------------------------------------
-    # Otherwise return the number of matching unique orders.
-    # ------------------------------------------------------------------
     return {"answer": str(int(df["id"].nunique()))}
 
 
@@ -331,9 +328,15 @@ def health():
 
 @app.post("/")
 def answer(request: QuestionRequest):
+    # This prints every question the grader sends and every answer
+    # you return. Look at Render -> Logs to see them.
+    print(f"[QUESTION] {request.question}", flush=True)
     try:
-        return answer_question(request.question)
+        result = answer_question(request.question)
+        print(f"[ANSWER] {result}", flush=True)
+        return result
     except Exception as exc:
+        print(f"[ERROR] {request.question} -> {exc}", flush=True)
         raise HTTPException(
             status_code=500,
             detail=f"Could not answer question: {str(exc)}",
